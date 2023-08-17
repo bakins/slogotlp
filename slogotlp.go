@@ -3,6 +3,8 @@ package slogotlp
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -15,23 +17,29 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
-	"golang.org/x/exp/slog"
+	"google.golang.org/api/support/bundler"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
-	otlpEndpointEnv = "OTEL_EXPORTER_OTLP_ENDPOINT"
-	otlpInsecureEnv = "OTEL_EXPORTER_OTLP_INSECURE"
+	otlpEndpointEnv     = "OTEL_EXPORTER_OTLP_ENDPOINT"
+	otlpLogsEndpointEnv = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
+	otlpInsecureEnv     = "OTEL_EXPORTER_OTLP_INSECURE"
+	otlpLogsInsecureEnv = "OTEL_EXPORTER_OTLP_LOGS_INSECURE"
 )
 
 type handlerOptions struct {
-	exporter        Exporter
-	resource        *resource.Resource
-	exporterOptions []ExporterOption
-	level           slog.Level
+	resource             *resource.Resource
+	insecure             *bool
+	errorHandler         func(error)
+	endpoint             string
+	level                slog.Level
+	bundleDelayThreshold time.Duration
+	bundleCountThreshold int
 }
 
+// HandlerOption applies an option when creating a Handler.
 type HandlerOption interface {
 	apply(*handlerOptions)
 }
@@ -40,18 +48,6 @@ type handlerOptionFunc func(*handlerOptions)
 
 func (o handlerOptionFunc) apply(opts *handlerOptions) {
 	o(opts)
-}
-
-func WithExporter(exporter Exporter) HandlerOption {
-	return handlerOptionFunc(func(o *handlerOptions) {
-		o.exporter = exporter
-	})
-}
-
-func WithExporterOptions(options ...ExporterOption) HandlerOption {
-	return handlerOptionFunc(func(o *handlerOptions) {
-		o.exporterOptions = options
-	})
 }
 
 func WithLevel(level slog.Level) HandlerOption {
@@ -66,57 +62,57 @@ func WithResource(resource *resource.Resource) HandlerOption {
 	})
 }
 
-// EnvSet returns if the OTLP environment variables are set.
-func EnvSet() bool {
-	return os.Getenv(otlpEndpointEnv) != ""
-}
-
-type Exporter interface {
-	UploadLogs(ctx context.Context, logs []*logspb.ResourceLogs) error
-	Shutdown(ctx context.Context) error
-}
-
-type GrpcExporter struct {
-	client collectorLogs.LogsServiceClient
-	conn   *grpc.ClientConn
-}
-
-type exporterOptions struct {
-	insecure *bool
-	endpoint string
-}
-
-type ExporterOption interface {
-	apply(*exporterOptions)
-}
-
-type exporterOptionFunc func(*exporterOptions)
-
-func (o exporterOptionFunc) apply(opts *exporterOptions) {
-	o(opts)
-}
-
-func WithEndpoint(endpoint string) ExporterOption {
-	return exporterOptionFunc(func(o *exporterOptions) {
+func WithEndpoint(endpoint string) HandlerOption {
+	return handlerOptionFunc(func(o *handlerOptions) {
 		o.endpoint = endpoint
 	})
 }
 
-func WithInsecure(insecure bool) ExporterOption {
-	return exporterOptionFunc(func(o *exporterOptions) {
+func WithInsecure(insecure bool) HandlerOption {
+	return handlerOptionFunc(func(o *handlerOptions) {
 		o.insecure = &insecure
 	})
 }
 
-func NewGrpcExporter(ctx context.Context, options ...ExporterOption) (*GrpcExporter, error) {
-	opts := exporterOptions{}
+func WithBundleDelayThreshold(delay time.Duration) HandlerOption {
+	return handlerOptionFunc(func(o *handlerOptions) {
+		o.bundleDelayThreshold = delay
+	})
+}
 
-	for _, o := range options {
-		o.apply(&opts)
-	}
+func WithBundleCountThreshold(count int) HandlerOption {
+	return handlerOptionFunc(func(o *handlerOptions) {
+		o.bundleCountThreshold = count
+	})
+}
 
+func WithErrorHandler(handler func(error)) HandlerOption {
+	return handlerOptionFunc(func(o *handlerOptions) {
+		o.errorHandler = handler
+	})
+}
+
+// EnvSet returns if the OTLP environment variables are set.
+func EnvSet() bool {
+	return os.Getenv(otlpLogsEndpointEnv) != "" || os.Getenv(otlpEndpointEnv) != ""
+}
+
+type exporter interface {
+	UploadLogs(ctx context.Context, logs []*logspb.ResourceLogs) error
+	Shutdown(ctx context.Context) error
+}
+
+type grpcExporter struct {
+	client collectorLogs.LogsServiceClient
+	conn   *grpc.ClientConn
+}
+
+func newGrpcExporter(ctx context.Context, opts handlerOptions) (*grpcExporter, error) {
 	if opts.endpoint == "" {
-		exporterTarget := os.Getenv(otlpEndpointEnv)
+		exporterTarget := os.Getenv(otlpLogsEndpointEnv)
+		if exporterTarget == "" {
+			exporterTarget = os.Getenv(otlpEndpointEnv)
+		}
 		if exporterTarget == "" {
 			return nil, fmt.Errorf("no endpoint provided")
 		}
@@ -124,8 +120,18 @@ func NewGrpcExporter(ctx context.Context, options ...ExporterOption) (*GrpcExpor
 		opts.endpoint = exporterTarget
 	}
 
+	u, err := url.Parse(opts.endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("unabel to parse endpoint %v", err)
+	}
+
 	if opts.insecure == nil {
-		if val := os.Getenv(otlpInsecureEnv); val != "" {
+		val := os.Getenv(otlpLogsInsecureEnv)
+		if val == "" {
+			val = os.Getenv(otlpInsecureEnv)
+		}
+
+		if val != "" {
 			if rc, err := strconv.ParseBool(val); err != nil {
 				opts.insecure = &rc
 			}
@@ -133,22 +139,24 @@ func NewGrpcExporter(ctx context.Context, options ...ExporterOption) (*GrpcExpor
 	}
 
 	var dialOptions []grpc.DialOption
-	if strings.HasPrefix(opts.endpoint, "http://") || (opts.insecure != nil && *opts.insecure) {
+
+	scheme := strings.ToLower(u.Scheme)
+	if scheme == "http" || (opts.insecure != nil && *opts.insecure) {
 		dialOptions = append(dialOptions, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	conn, err := grpc.DialContext(ctx, opts.endpoint, dialOptions...)
+	conn, err := grpc.DialContext(ctx, u.Host, dialOptions...)
 	if err != nil {
 		return nil, err
 	}
 
-	return &GrpcExporter{
+	return &grpcExporter{
 		client: collectorLogs.NewLogsServiceClient(conn),
 		conn:   conn,
 	}, nil
 }
 
-func (e *GrpcExporter) UploadLogs(ctx context.Context, logs []*logspb.ResourceLogs) error {
+func (e *grpcExporter) UploadLogs(ctx context.Context, logs []*logspb.ResourceLogs) error {
 	request := collectorLogs.ExportLogsServiceRequest{
 		ResourceLogs: logs,
 	}
@@ -161,30 +169,83 @@ func (e *GrpcExporter) UploadLogs(ctx context.Context, logs []*logspb.ResourceLo
 	return nil
 }
 
-func (e *GrpcExporter) Shutdown(ctx context.Context) error {
+func (e *grpcExporter) Shutdown(ctx context.Context) error {
 	return e.conn.Close()
 }
 
-func NewHandler(options ...HandlerOption) (*Handler, error) {
+type bundlerExporter struct {
+	bundler  *bundler.Bundler
+	exporter exporter
+}
+
+func newBundlerExporter(exporter exporter, opts handlerOptions) *bundlerExporter {
+	b := bundler.NewBundler((*logspb.ResourceLogs)(nil), func(bundle any) {
+		// just to be sure
+		bundleLogs, ok := bundle.([]*logspb.ResourceLogs)
+		if !ok {
+			return
+		}
+
+		// How to handle errors here?
+		err := exporter.UploadLogs(context.Background(), bundleLogs)
+		if err != nil && opts.errorHandler != nil {
+			opts.errorHandler(err)
+		}
+	})
+
+	b.BundleCountThreshold = opts.bundleCountThreshold
+	b.DelayThreshold = opts.bundleDelayThreshold
+
+	return &bundlerExporter{
+		bundler:  b,
+		exporter: exporter,
+	}
+}
+
+func (b *bundlerExporter) UploadLogs(ctx context.Context, logs []*logspb.ResourceLogs) error {
+	var lastError error
+	for _, l := range logs {
+		if err := b.bundler.AddWait(ctx, l, 1); err != nil {
+			lastError = err
+		}
+	}
+
+	return lastError
+}
+
+func (b *bundlerExporter) Shutdown(ctx context.Context) error {
+	b.bundler.Flush()
+	return b.exporter.Shutdown(ctx)
+}
+
+// NewHandler creates a new slog.Handler.
+func NewHandler(ctx context.Context, options ...HandlerOption) (*Handler, error) {
 	opts := handlerOptions{
-		level: slog.LevelInfo,
+		level:                slog.LevelInfo,
+		bundleCountThreshold: bundler.DefaultBundleCountThreshold,
+		bundleDelayThreshold: bundler.DefaultDelayThreshold,
+		errorHandler: func(err error) {
+			_, _ = fmt.Fprintln(os.Stderr, "[slogotlp] error", err)
+		},
 	}
 
 	for _, o := range options {
 		o.apply(&opts)
 	}
 
-	if opts.exporter == nil {
-		exporter, err := NewGrpcExporter(context.Background(), opts.exporterOptions...)
-		if err != nil {
-			return nil, err
-		}
+	g, err := newGrpcExporter(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
 
-		opts.exporter = exporter
+	var exporter exporter = g
+
+	if opts.bundleCountThreshold > 0 {
+		exporter = newBundlerExporter(exporter, opts)
 	}
 
 	h := Handler{
-		exporter: opts.exporter,
+		exporter: exporter,
 		level:    opts.level,
 	}
 
@@ -195,17 +256,20 @@ func NewHandler(options ...HandlerOption) (*Handler, error) {
 	return &h, nil
 }
 
+// Handler implements the slog.Handler interface.
 type Handler struct {
-	exporter Exporter
+	exporter exporter
+	resource *resourcepb.Resource
 	attrs    []slog.Attr
 	level    slog.Level
-	resource *resourcepb.Resource
 }
 
 var _ slog.Handler = &Handler{}
 
-func (h *Handler) Close() error {
-	return h.exporter.Shutdown(context.Background())
+// Shutdown shutsdown the handler. This should be called before the process exits
+// to flush buffers and close conenctions.
+func (h *Handler) Shutdown(ctx context.Context) error {
+	return h.exporter.Shutdown(ctx)
 }
 
 func (h *Handler) Enabled(_ context.Context, level slog.Level) bool {
