@@ -2,15 +2,16 @@ package slogotlp
 
 import (
 	"context"
+	"encoding"
 	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/bakins/slogotlp/internal/transform"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/trace"
 	collectorLogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
@@ -20,6 +21,8 @@ import (
 	"google.golang.org/api/support/bundler"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/bakins/slogotlp/internal/transform"
 )
 
 const (
@@ -429,35 +432,85 @@ func convertAttributeValue(v slog.Value) *commonpb.AnyValue {
 		return convertAttributeValue(val)
 
 	case slog.KindAny:
-		if val, ok := v.Any().(error); ok {
+		value := v.Any()
+
+		if tm, ok := value.(encoding.TextMarshaler); ok {
+			data, err := tm.MarshalText()
+			if err != nil {
+				return nil
+			}
+
 			return &commonpb.AnyValue{
 				Value: &commonpb.AnyValue_StringValue{
-					StringValue: val.Error(),
+					StringValue: string(data),
 				},
 			}
 		}
 
-		if val, ok := v.Any().(fmt.Stringer); ok {
+		if str, ok := value.(fmt.Stringer); ok {
 			return &commonpb.AnyValue{
 				Value: &commonpb.AnyValue_StringValue{
-					StringValue: val.String(),
+					StringValue: str.String(),
 				},
 			}
 		}
 
-		if val, ok := v.Any().(fmt.Stringer); ok {
+		if err, ok := value.(error); ok {
 			return &commonpb.AnyValue{
 				Value: &commonpb.AnyValue_StringValue{
-					StringValue: val.String(),
+					StringValue: err.Error(),
 				},
 			}
 		}
 
-		// TODO: handle other types.
+		if bs, ok := value.([]byte); ok {
+			return &commonpb.AnyValue{
+				Value: &commonpb.AnyValue_StringValue{
+					StringValue: strconv.Quote(string(bs)),
+				},
+			}
+		}
+
+		rt := reflect.TypeOf(value)
+		kind := rt.Kind()
+
+		switch kind {
+		case reflect.Slice, reflect.Array:
+			// special case for byte slices
+			if rt.Elem().Kind() == reflect.Uint8 {
+				return &commonpb.AnyValue{
+					Value: &commonpb.AnyValue_StringValue{
+						StringValue: strconv.Quote(string(reflect.ValueOf(value).Bytes())),
+					},
+				}
+			}
+
+			s := reflect.ValueOf(value)
+
+			arrayValue := commonpb.ArrayValue{
+				Values: make([]*commonpb.AnyValue, 0, s.Len()),
+			}
+
+			for i := 0; i < s.Len(); i++ {
+				item := s.Index(i).Interface()
+				if val := convertAttributeValue(slog.AnyValue(item)); val != nil {
+					arrayValue.Values = append(arrayValue.Values, val)
+				}
+			}
+
+			return &commonpb.AnyValue{
+				Value: &commonpb.AnyValue_ArrayValue{
+					ArrayValue: &arrayValue,
+				},
+			}
+
+		default:
+			// fallthrough to below
+		}
 
 		return &commonpb.AnyValue{
 			Value: &commonpb.AnyValue_StringValue{
-				StringValue: fmt.Sprintf("%v", v.Any()),
+				StringValue: fmt.Sprintf("%+v", value),
 			},
 		}
 	default:
