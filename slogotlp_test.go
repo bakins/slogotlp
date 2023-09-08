@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -43,7 +42,11 @@ func TestHandler(t *testing.T) {
 		g.Stop()
 	})
 
-	handler, err := slogotlp.NewHandler(context.Background(), slogotlp.WithEndpoint("http://"+listener.Addr().String()))
+	handler, err := slogotlp.NewHandler(
+		context.Background(),
+		slogotlp.WithEndpoint("http://"+listener.Addr().String()),
+		slogotlp.WithDialOptions(grpc.WithBlock()),
+	)
 	is.NoErr(err)
 
 	t.Cleanup(func() {
@@ -53,7 +56,6 @@ func TestHandler(t *testing.T) {
 
 	logger := slog.New(handler)
 	for i := 0; i < 10; i++ {
-		fmt.Println("logging")
 		logger.Info("test", "index", i)
 	}
 

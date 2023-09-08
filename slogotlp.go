@@ -1,3 +1,5 @@
+// Purpose: slogotlp is a slog.Handler that sends logs to an OpenTelemetry collector.
+// Currently, only grpc is supported.
 package slogotlp
 
 import (
@@ -37,6 +39,7 @@ type handlerOptions struct {
 	insecure             *bool
 	errorHandler         func(error)
 	endpoint             string
+	dialOptions          []grpc.DialOption
 	level                slog.Level
 	bundleDelayThreshold time.Duration
 	bundleCountThreshold int
@@ -53,45 +56,59 @@ func (o handlerOptionFunc) apply(opts *handlerOptions) {
 	o(opts)
 }
 
+// WithLevel sets the minimum level to log. The default is slog.LevelInfo.
 func WithLevel(level slog.Level) HandlerOption {
 	return handlerOptionFunc(func(o *handlerOptions) {
 		o.level = level
 	})
 }
 
+// WithResource sets the resource. There is no default.
 func WithResource(resource *resource.Resource) HandlerOption {
 	return handlerOptionFunc(func(o *handlerOptions) {
 		o.resource = resource
 	})
 }
 
+// WithEndpoint sets the endpoint. If not set, this will be read from the environment
 func WithEndpoint(endpoint string) HandlerOption {
 	return handlerOptionFunc(func(o *handlerOptions) {
 		o.endpoint = endpoint
 	})
 }
 
+// WithInsecure sets the insecure flag. If not set, this will be read from the environment
 func WithInsecure(insecure bool) HandlerOption {
 	return handlerOptionFunc(func(o *handlerOptions) {
 		o.insecure = &insecure
 	})
 }
 
+// WithBundleDelayThreshold sets the bundle delay threshold. The default is bundler.DefaultDelayThreshold.
 func WithBundleDelayThreshold(delay time.Duration) HandlerOption {
 	return handlerOptionFunc(func(o *handlerOptions) {
 		o.bundleDelayThreshold = delay
 	})
 }
 
+// WithBundleCountThreshold sets the bundle count threshold. The default is bundler.DefaultBundleCountThreshold.
 func WithBundleCountThreshold(count int) HandlerOption {
 	return handlerOptionFunc(func(o *handlerOptions) {
 		o.bundleCountThreshold = count
 	})
 }
 
+// WithErrorHandler sets the error handler. If not set, errors are logged to stderr.
 func WithErrorHandler(handler func(error)) HandlerOption {
 	return handlerOptionFunc(func(o *handlerOptions) {
 		o.errorHandler = handler
+	})
+}
+
+// WithDialOptions sets the grpc dial options.
+func WithDialOptions(opts ...grpc.DialOption) HandlerOption {
+	return handlerOptionFunc(func(o *handlerOptions) {
+		o.dialOptions = opts
 	})
 }
 
@@ -147,6 +164,8 @@ func newGrpcExporter(ctx context.Context, opts handlerOptions) (*grpcExporter, e
 	if scheme == "http" || (opts.insecure != nil && *opts.insecure) {
 		dialOptions = append(dialOptions, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
+
+	dialOptions = append(dialOptions, opts.dialOptions...)
 
 	conn, err := grpc.DialContext(ctx, u.Host, dialOptions...)
 	if err != nil {
@@ -515,7 +534,7 @@ func convertAttributeValue(v slog.Value) *commonpb.AnyValue {
 		}
 	default:
 		// unhandled kind
-		_, _ = fmt.Fprintf(os.Stderr, "[proxylogger] unhandled kind %T %v %v\n", v.Any(), v.Kind(), v.Any())
+		_, _ = fmt.Fprintf(os.Stderr, "[slogotlp] unhandled kind %T %v %v\n", v.Any(), v.Kind(), v.Any())
 		return nil
 	}
 }
