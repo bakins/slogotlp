@@ -1,6 +1,6 @@
 # slogoltp
 
-[![Go Reference](https://pkg.go.dev/badge/go.dev/github.com/bakins/slogotlp.svg)](https://pkg.go.dev/go.dev/github.com/bakins/slogotlp)
+[![Go Reference](https://pkg.go.dev/badge/go.dev/github.com/bakins/slogotlp.svg)](https://pkg.go.dev/github.com/bakins/slogotlp)
 
 OpenTelemetry oltp exporter support for [slog](https://pkg.go.dev/log/slog).
 
