@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -282,6 +283,7 @@ func NewHandler(ctx context.Context, options ...HandlerOption) (*Handler, error)
 type Handler struct {
 	exporter exporter
 	resource *resourcepb.Resource
+	group    *group
 	attrs    []slog.Attr
 	level    slog.Level
 }
@@ -300,59 +302,32 @@ func (h *Handler) Enabled(_ context.Context, level slog.Level) bool {
 
 // WithGroup is a no-op, as we do not support groups yet.
 func (h *Handler) WithGroup(name string) slog.Handler {
-	if name == "" {
-		return h
+	h2 := *h
+
+	h2.group = &group{
+		next: h.group,
+		name: name,
 	}
 
-	n := *h
-
-	return &n
+	return &h2
 }
 
 func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	n := *h
-
-	cp := make([]slog.Attr, 0, len(n.attrs)+len(attrs))
-	cp = append(cp, n.attrs...)
-	cp = append(cp, attrs...)
-	n.attrs = cp
-
-	return &n
+	h2 := *h
+	if h2.group != nil {
+		h2.group = h2.group.Clone()
+		h2.group.AddAttrs(attrs)
+	} else {
+		newAttrs := make([]slog.Attr, 0, len(h.attrs)+len(attrs))
+		newAttrs = append(newAttrs, h.attrs...)
+		newAttrs = append(newAttrs, attrs...)
+		h2.attrs = newAttrs
+	}
+	return &h2
 }
 
 func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
-	severityNumber := logspb.SeverityNumber(record.Level + 9)
-
-	timeNow := uint64(record.Time.UnixNano())
-
-	logRecord := logspb.LogRecord{
-		TimeUnixNano:         timeNow,
-		ObservedTimeUnixNano: timeNow,
-		SeverityNumber:       severityNumber,
-		SeverityText:         severityNumber.String(),
-		Body: &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_StringValue{
-				StringValue: record.Message,
-			},
-		},
-		Attributes: make([]*commonpb.KeyValue, 0, len(h.attrs)),
-	}
-
-	for _, a := range h.attrs {
-		kv := convertAttribute(a)
-		if kv != nil {
-			logRecord.Attributes = append(logRecord.Attributes, kv)
-		}
-	}
-
-	record.Attrs(func(a slog.Attr) bool {
-		kv := convertAttribute(a)
-		if kv != nil {
-			logRecord.Attributes = append(logRecord.Attributes, kv)
-		}
-
-		return true
-	})
+	logRecord := h.convertRecord(record)
 
 	if spanContext := trace.SpanContextFromContext(ctx); spanContext.HasTraceID() {
 		traceID := spanContext.TraceID()
@@ -371,7 +346,7 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 		ScopeLogs: []*logspb.ScopeLogs{
 			{
 				LogRecords: []*logspb.LogRecord{
-					&logRecord,
+					logRecord,
 				},
 			},
 		},
@@ -382,20 +357,139 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 	return h.exporter.UploadLogs(ctx, []*logspb.ResourceLogs{&rl})
 }
 
-func convertAttribute(attr slog.Attr) *commonpb.KeyValue {
-	value := convertAttributeValue(attr.Value)
-	if value == nil {
-		return nil
+func (h *Handler) convertRecord(r slog.Record) *logspb.LogRecord {
+	severityNumber := logspb.SeverityNumber(r.Level + 9)
+
+	timeNow := uint64(r.Time.UnixNano())
+
+	record := logspb.LogRecord{
+		TimeUnixNano:         timeNow,
+		ObservedTimeUnixNano: timeNow,
+		SeverityNumber:       severityNumber,
+		SeverityText:         severityNumber.String(),
+		Body: &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_StringValue{
+				StringValue: r.Message,
+			},
+		},
 	}
 
-	return &commonpb.KeyValue{
-		Key:   attr.Key,
-		Value: value,
+	n := r.NumAttrs()
+	if h.group != nil {
+		if n > 0 {
+			buf := newKVBuffer(n)
+			r.Attrs(buf.AddAttr)
+			record.Attributes = append(record.Attributes, h.group.KeyValue(buf.KeyValues()...))
+		} else {
+			// A Handler should not output groups if there are no attributes.
+			g := h.group.NextNonEmpty()
+			if g != nil {
+				record.Attributes = append(record.Attributes, g.KeyValue())
+			}
+		}
+	} else if n > 0 {
+		buf := newKVBuffer(n)
+		r.Attrs(buf.AddAttr)
+		record.Attributes = append(record.Attributes, buf.data...)
+	}
+
+	return &record
+}
+
+// group support is based on https://github.com/open-telemetry/opentelemetry-go-contrib/blob/bridges/otelslog/v0.0.1/bridges/otelslog/handler.go
+// which is Apache 2.0 Licensed
+
+type kvBuffer struct {
+	data []*commonpb.KeyValue
+}
+
+func newKVBuffer(n int) *kvBuffer {
+	return &kvBuffer{data: make([]*commonpb.KeyValue, 0, n)}
+}
+
+func (b *kvBuffer) Clone() *kvBuffer {
+	if b == nil {
+		return b
+	}
+	b2 := *b
+	b2.data = slices.Clone(b.data)
+	return &b2
+}
+
+func (b *kvBuffer) Len() int {
+	if b == nil {
+		return 0
+	}
+	return len(b.data)
+}
+
+func (b *kvBuffer) AddAttrs(attrs []slog.Attr) {
+	b.data = slices.Grow(b.data, len(attrs))
+	for _, a := range attrs {
+		_ = b.AddAttr(a)
 	}
 }
 
-func convertAttributeValue(v slog.Value) *commonpb.AnyValue {
+func (b *kvBuffer) AddAttr(attr slog.Attr) bool {
+	if attr.Key == "" {
+		if attr.Value.Kind() == slog.KindGroup {
+			// A Handler should inline the Attrs of a group with an empty key.
+			for _, a := range attr.Value.Group() {
+				b.data = append(b.data, &commonpb.KeyValue{
+					Key:   a.Key,
+					Value: convertValue(a.Value),
+				})
+			}
+			return true
+		}
+
+		if attr.Value.Any() == nil {
+			// A Handler should ignore an empty Attr.
+			return true
+		}
+	}
+	b.data = append(b.data, &commonpb.KeyValue{
+		Key:   attr.Key,
+		Value: convertValue(attr.Value),
+	})
+	return true
+}
+
+// group represents a group received from slog.
+type group struct {
+	next  *group
+	attrs *kvBuffer
+	name  string
+}
+
+func (g *group) NextNonEmpty() *group {
+	if g == nil || g.attrs.Len() > 0 {
+		return g
+	}
+	return g.next.NextNonEmpty()
+}
+
+func (g *group) Clone() *group {
+	if g == nil {
+		return g
+	}
+	g2 := *g
+	g2.attrs = g2.attrs.Clone()
+	return &g2
+}
+
+func (g *group) AddAttrs(attrs []slog.Attr) {
+	if g.attrs == nil {
+		g.attrs = newKVBuffer(len(attrs))
+	}
+	g.attrs.AddAttrs(attrs)
+}
+
+func convertValue(v slog.Value) *commonpb.AnyValue {
 	switch v.Kind() {
+	case slog.KindAny:
+		return convertAny(v.Any())
+
 	case slog.KindBool:
 		return &commonpb.AnyValue{
 			Value: &commonpb.AnyValue_BoolValue{
@@ -405,8 +499,8 @@ func convertAttributeValue(v slog.Value) *commonpb.AnyValue {
 
 	case slog.KindDuration:
 		return &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_DoubleValue{
-				DoubleValue: v.Duration().Seconds(),
+			Value: &commonpb.AnyValue_IntValue{
+				IntValue: v.Duration().Nanoseconds(),
 			},
 		}
 
@@ -433,108 +527,163 @@ func convertAttributeValue(v slog.Value) *commonpb.AnyValue {
 
 	case slog.KindTime:
 		return &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_StringValue{
-				StringValue: v.Time().Format(time.RFC3339Nano),
+			Value: &commonpb.AnyValue_IntValue{
+				IntValue: v.Time().UnixNano(),
 			},
 		}
 
 	case slog.KindUint64:
-		// otel doesn't support uint64, so this may get truncated...
 		return &commonpb.AnyValue{
 			Value: &commonpb.AnyValue_IntValue{
 				IntValue: int64(v.Uint64()),
 			},
 		}
 
+	case slog.KindGroup:
+		buf := newKVBuffer(5)
+		buf.AddAttrs(v.Group())
+		return &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_KvlistValue{
+				KvlistValue: &commonpb.KeyValueList{
+					Values: buf.data,
+				},
+			},
+		}
+
 	case slog.KindLogValuer:
-		val := v.LogValuer().LogValue()
-		return convertAttributeValue(val)
+		return convertValue(v.Resolve())
 
-	case slog.KindAny:
-		value := v.Any()
+	default:
+		_, _ = fmt.Fprintf(os.Stderr, "[slogotlp] unhandled kind %T %v %v\n", v.Any(), v.Kind(), v.Any())
 
-		if tm, ok := value.(encoding.TextMarshaler); ok {
-			data, err := tm.MarshalText()
-			if err != nil {
-				return nil
-			}
-
-			return &commonpb.AnyValue{
-				Value: &commonpb.AnyValue_StringValue{
-					StringValue: string(data),
-				},
-			}
+		return &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_StringValue{
+				StringValue: fmt.Sprintf("unhandled: (%s) %+v", v.Kind(), v.Any()),
+			},
 		}
+	}
+}
 
-		if str, ok := value.(fmt.Stringer); ok {
-			return &commonpb.AnyValue{
-				Value: &commonpb.AnyValue_StringValue{
-					StringValue: str.String(),
-				},
-			}
-		}
-
-		if err, ok := value.(error); ok {
-			return &commonpb.AnyValue{
-				Value: &commonpb.AnyValue_StringValue{
-					StringValue: err.Error(),
-				},
-			}
-		}
-
-		if bs, ok := value.([]byte); ok {
-			return &commonpb.AnyValue{
-				Value: &commonpb.AnyValue_StringValue{
-					StringValue: strconv.Quote(string(bs)),
-				},
-			}
-		}
-
-		rt := reflect.TypeOf(value)
-		kind := rt.Kind()
-
-		switch kind {
-		case reflect.Slice, reflect.Array:
-			// special case for byte slices
-			if rt.Elem().Kind() == reflect.Uint8 {
-				return &commonpb.AnyValue{
-					Value: &commonpb.AnyValue_StringValue{
-						StringValue: strconv.Quote(string(reflect.ValueOf(value).Bytes())),
-					},
-				}
-			}
-
-			s := reflect.ValueOf(value)
-
-			arrayValue := commonpb.ArrayValue{
-				Values: make([]*commonpb.AnyValue, 0, s.Len()),
-			}
-
-			for i := 0; i < s.Len(); i++ {
-				item := s.Index(i).Interface()
-				if val := convertAttributeValue(slog.AnyValue(item)); val != nil {
-					arrayValue.Values = append(arrayValue.Values, val)
-				}
-			}
-
-			return &commonpb.AnyValue{
-				Value: &commonpb.AnyValue_ArrayValue{
-					ArrayValue: &arrayValue,
-				},
-			}
-
-		default:
-			// fallthrough to below
+func convertAny(value any) *commonpb.AnyValue {
+	if tm, ok := value.(encoding.TextMarshaler); ok {
+		data, err := tm.MarshalText()
+		if err != nil {
+			return nil
 		}
 
 		return &commonpb.AnyValue{
 			Value: &commonpb.AnyValue_StringValue{
-				StringValue: fmt.Sprintf("%+v", value),
+				StringValue: string(data),
 			},
 		}
-	default:
-		// unhandled kind
-		_, _ = fmt.Fprintf(os.Stderr, "[slogotlp] unhandled kind %T %v %v\n", v.Any(), v.Kind(), v.Any())
-		return nil
 	}
+
+	if str, ok := value.(fmt.Stringer); ok {
+		return &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_StringValue{
+				StringValue: str.String(),
+			},
+		}
+	}
+
+	if err, ok := value.(error); ok {
+		return &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_StringValue{
+				StringValue: err.Error(),
+			},
+		}
+	}
+
+	if bs, ok := value.([]byte); ok {
+		return &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_StringValue{
+				StringValue: strconv.Quote(string(bs)),
+			},
+		}
+	}
+
+	rt := reflect.TypeOf(value)
+	kind := rt.Kind()
+
+	switch kind {
+	case reflect.Slice, reflect.Array:
+		// special case for byte slices
+		if rt.Elem().Kind() == reflect.Uint8 {
+			return &commonpb.AnyValue{
+				Value: &commonpb.AnyValue_StringValue{
+					StringValue: strconv.Quote(string(reflect.ValueOf(value).Bytes())),
+				},
+			}
+		}
+
+		s := reflect.ValueOf(value)
+
+		arrayValue := commonpb.ArrayValue{
+			Values: make([]*commonpb.AnyValue, 0, s.Len()),
+		}
+
+		for i := 0; i < s.Len(); i++ {
+			item := s.Index(i).Interface()
+			if val := convertValue(slog.AnyValue(item)); val != nil {
+				arrayValue.Values = append(arrayValue.Values, val)
+			}
+		}
+
+		return &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_ArrayValue{
+				ArrayValue: &arrayValue,
+			},
+		}
+
+	default:
+		// fallthrough to below
+	}
+
+	return &commonpb.AnyValue{
+		Value: &commonpb.AnyValue_StringValue{
+			StringValue: fmt.Sprintf("%+v", value),
+		},
+	}
+}
+
+func (g *group) KeyValue(kvs ...*commonpb.KeyValue) *commonpb.KeyValue {
+	// Assumes checking of group g already performed (i.e. non-empty).
+	out := &commonpb.KeyValue{
+		Key: g.name,
+		Value: &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_KvlistValue{
+				KvlistValue: &commonpb.KeyValueList{
+					Values: g.attrs.data,
+				},
+			},
+		},
+	}
+
+	g = g.next
+	for g != nil {
+		// A Handler should not output groups if there are no attributes.
+		if g.attrs.Len() > 0 {
+			out = &commonpb.KeyValue{
+				Key: g.name,
+				Value: &commonpb.AnyValue{
+					Value: &commonpb.AnyValue_KvlistValue{
+						KvlistValue: &commonpb.KeyValueList{
+							Values: []*commonpb.KeyValue{
+								out,
+							},
+						},
+					},
+				},
+			}
+		}
+		g = g.next
+	}
+	return out
+}
+
+func (b *kvBuffer) KeyValues(kvs ...*commonpb.KeyValue) []*commonpb.KeyValue {
+	if b == nil {
+		return kvs
+	}
+	return append(b.data, kvs...)
 }
