@@ -45,7 +45,6 @@ func TestHandler(t *testing.T) {
 	handler, err := slogotlp.NewHandler(
 		t.Context(),
 		slogotlp.WithEndpoint("http://"+listener.Addr().String()),
-		slogotlp.WithDialOptions(grpc.WithBlock()),
 	)
 	is.NoErr(err)
 
@@ -110,7 +109,6 @@ func newTestHandler(t *testing.T) (*slogotlp.Handler, *testCollector) {
 	handler, err := slogotlp.NewHandler(
 		t.Context(),
 		slogotlp.WithEndpoint("http://"+listener.Addr().String()),
-		slogotlp.WithDialOptions(grpc.WithBlock()),
 	)
 	is.NoErr(err)
 
@@ -170,8 +168,7 @@ func TestInsecureEnv(t *testing.T) {
 			handler, err := slogotlp.NewHandler(
 				t.Context(),
 				slogotlp.WithEndpoint("//"+listener.Addr().String()),
-				slogotlp.WithDialOptions(grpc.WithBlock()),
-			)
+					)
 			is.NoErr(err)
 			t.Cleanup(func() { _ = handler.Shutdown(context.Background()) })
 
