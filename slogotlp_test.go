@@ -201,6 +201,96 @@ func TestInsecureEnvInvalid(t *testing.T) {
 	is.True(err != nil)
 }
 
+// TestGroupSiblingIsolation guards against backing-array aliasing in
+// kvBuffer.KeyValues / group.KeyValue. A single logger built with WithGroup
+// + With(...) is reused for multiple sibling log calls. Each call must produce
+// a record with its own per-call attribute, and earlier records must not be
+// mutated by later ones (records are buffered before export, so any aliasing
+// of the group's attrs slice would corrupt earlier records when later calls
+// append into the same backing array).
+func TestGroupSiblingIsolation(t *testing.T) {
+	is := is.New(t)
+	handler, collector := newTestHandler(t)
+
+	lg := slog.New(handler).WithGroup("g").With("static", "fixed")
+	for i := range 5 {
+		lg.Info("m", "i", int64(i))
+	}
+
+	is.NoErr(handler.Shutdown(context.Background()))
+	is.Equal(5, len(collector.logRecords))
+
+	for idx, rec := range collector.logRecords {
+		g := findAttr(rec.Attributes, "g")
+		is.True(g != nil)
+		inner := kvList(g)
+		is.Equal(2, len(inner))
+		is.Equal("fixed", findAttr(inner, "static").GetStringValue())
+		is.Equal(int64(idx), findAttr(inner, "i").GetIntValue())
+	}
+}
+
+// TestNestedGroupSiblingIsolation does the same as above with a nested group
+// chain, exercising the outer-group wrapping path in group.KeyValue.
+func TestNestedGroupSiblingIsolation(t *testing.T) {
+	is := is.New(t)
+	handler, collector := newTestHandler(t)
+
+	lg := slog.New(handler).WithGroup("outer").With("o", "fixed").WithGroup("inner").With("in", "static")
+	for i := range 4 {
+		lg.Info("m", "i", int64(i))
+	}
+
+	is.NoErr(handler.Shutdown(context.Background()))
+	is.Equal(4, len(collector.logRecords))
+
+	for idx, rec := range collector.logRecords {
+		outer := findAttr(rec.Attributes, "outer")
+		is.True(outer != nil)
+		oKvs := kvList(outer)
+		is.Equal("fixed", findAttr(oKvs, "o").GetStringValue())
+		inner := findAttr(oKvs, "inner")
+		is.True(inner != nil)
+		iKvs := kvList(inner)
+		is.Equal("static", findAttr(iKvs, "in").GetStringValue())
+		is.Equal(int64(idx), findAttr(iKvs, "i").GetIntValue())
+	}
+}
+
+// TestSiblingHandlersIsolated guards against shared state when WithAttrs is
+// called twice on the same parent group handler to produce two siblings.
+func TestSiblingHandlersIsolated(t *testing.T) {
+	is := is.New(t)
+	handler, collector := newTestHandler(t)
+
+	parent := slog.New(handler).WithGroup("g")
+	a := parent.With("who", "a")
+	b := parent.With("who", "b")
+
+	a.Info("m", "k", "av")
+	b.Info("m", "k", "bv")
+
+	is.NoErr(handler.Shutdown(context.Background()))
+	is.Equal(2, len(collector.logRecords))
+
+	for _, rec := range collector.logRecords {
+		g := findAttr(rec.Attributes, "g")
+		is.True(g != nil)
+		inner := kvList(g)
+		is.Equal(2, len(inner))
+		who := findAttr(inner, "who").GetStringValue()
+		k := findAttr(inner, "k").GetStringValue()
+		switch who {
+		case "a":
+			is.Equal("av", k)
+		case "b":
+			is.Equal("bv", k)
+		default:
+			is.Fail()
+		}
+	}
+}
+
 func TestGroups(t *testing.T) {
 	tests := map[string]struct {
 		log      func(*slog.Logger)

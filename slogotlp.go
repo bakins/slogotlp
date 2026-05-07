@@ -683,9 +683,16 @@ func (g *group) KeyValue(kvs ...*commonpb.KeyValue) *commonpb.KeyValue {
 	return out
 }
 
+// KeyValues returns a fresh slice combining b.data and kvs. It always
+// allocates a new backing array so callers can store the result without risk
+// of later appends into b.data overwriting earlier results (which would
+// corrupt buffered log records before export).
 func (b *kvBuffer) KeyValues(kvs ...*commonpb.KeyValue) []*commonpb.KeyValue {
 	if b == nil {
-		return kvs
+		return slices.Clone(kvs)
 	}
-	return append(b.data, kvs...)
+	out := make([]*commonpb.KeyValue, 0, len(b.data)+len(kvs))
+	out = append(out, b.data...)
+	out = append(out, kvs...)
+	return out
 }
