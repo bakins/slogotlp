@@ -168,7 +168,7 @@ func newGrpcExporter(ctx context.Context, opts handlerOptions) (*grpcExporter, e
 
 	dialOptions = append(dialOptions, opts.dialOptions...)
 
-	conn, err := grpc.DialContext(ctx, u.Host, dialOptions...)
+	conn, err := grpc.NewClient(u.Host, dialOptions...)
 	if err != nil {
 		return nil, err
 	}
