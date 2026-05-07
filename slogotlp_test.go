@@ -43,7 +43,7 @@ func TestHandler(t *testing.T) {
 	})
 
 	handler, err := slogotlp.NewHandler(
-		context.Background(),
+		t.Context(),
 		slogotlp.WithEndpoint("http://"+listener.Addr().String()),
 		slogotlp.WithDialOptions(grpc.WithBlock()),
 	)
@@ -55,7 +55,7 @@ func TestHandler(t *testing.T) {
 	})
 
 	logger := slog.New(handler)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		logger.Info("test", "index", i)
 	}
 
@@ -108,7 +108,7 @@ func newTestHandler(t *testing.T) (*slogotlp.Handler, *testCollector) {
 	})
 
 	handler, err := slogotlp.NewHandler(
-		context.Background(),
+		t.Context(),
 		slogotlp.WithEndpoint("http://"+listener.Addr().String()),
 		slogotlp.WithDialOptions(grpc.WithBlock()),
 	)
@@ -135,6 +135,73 @@ func kvList(av *commonpb.AnyValue) []*commonpb.KeyValue {
 		return nil
 	}
 	return av.GetKvlistValue().GetValues()
+}
+
+func TestInsecureEnv(t *testing.T) {
+	tests := map[string]struct {
+		envKey   string
+		envValue string
+	}{
+		"OTEL_EXPORTER_OTLP_INSECURE true":      {envKey: "OTEL_EXPORTER_OTLP_INSECURE", envValue: "true"},
+		"OTEL_EXPORTER_OTLP_LOGS_INSECURE true": {envKey: "OTEL_EXPORTER_OTLP_LOGS_INSECURE", envValue: "true"},
+		"OTEL_EXPORTER_OTLP_INSECURE 1":         {envKey: "OTEL_EXPORTER_OTLP_INSECURE", envValue: "1"},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			is := is.New(t)
+
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			is.NoErr(err)
+			t.Cleanup(func() { _ = listener.Close() })
+
+			collector := &testCollector{}
+			g := grpc.NewServer()
+			collectorLogs.RegisterLogsServiceServer(g, collector)
+			go func() { _ = g.Serve(listener) }()
+			t.Cleanup(func() { g.Stop() })
+
+			t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "")
+			t.Setenv("OTEL_EXPORTER_OTLP_LOGS_INSECURE", "")
+			t.Setenv(test.envKey, test.envValue)
+
+			// Endpoint without "http" scheme so the insecure decision must come
+			// from the env var path, not the scheme shortcut.
+			handler, err := slogotlp.NewHandler(
+				t.Context(),
+				slogotlp.WithEndpoint("//"+listener.Addr().String()),
+				slogotlp.WithDialOptions(grpc.WithBlock()),
+			)
+			is.NoErr(err)
+			t.Cleanup(func() { _ = handler.Shutdown(context.Background()) })
+
+			logger := slog.New(handler)
+			logger.Info("hello")
+
+			is.NoErr(handler.Shutdown(context.Background()))
+			is.Equal(1, len(collector.logRecords))
+		})
+	}
+}
+
+func TestInsecureEnvInvalid(t *testing.T) {
+	// Invalid bool values should be ignored (insecure stays unset). With no
+	// "http" scheme and no insecure flag, grpc.DialContext returns an error
+	// because no transport credentials are configured.
+	is := is.New(t)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	is.NoErr(err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "not-a-bool")
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_INSECURE", "")
+
+	_, err = slogotlp.NewHandler(
+		context.Background(),
+		slogotlp.WithEndpoint("//"+listener.Addr().String()),
+	)
+	is.True(err != nil)
 }
 
 func TestGroups(t *testing.T) {
@@ -351,7 +418,7 @@ func TestTypes(t *testing.T) {
 				g.Stop()
 			})
 
-			handler, err := slogotlp.NewHandler(context.Background(), slogotlp.WithEndpoint("http://"+listener.Addr().String()))
+			handler, err := slogotlp.NewHandler(t.Context(), slogotlp.WithEndpoint("http://"+listener.Addr().String()))
 			is.NoErr(err)
 
 			t.Cleanup(func() {

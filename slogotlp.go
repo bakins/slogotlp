@@ -153,7 +153,7 @@ func newGrpcExporter(ctx context.Context, opts handlerOptions) (*grpcExporter, e
 		}
 
 		if val != "" {
-			if rc, err := strconv.ParseBool(val); err != nil {
+			if rc, err := strconv.ParseBool(val); err == nil {
 				opts.insecure = &rc
 			}
 		}
