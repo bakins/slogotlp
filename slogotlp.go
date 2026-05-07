@@ -300,7 +300,9 @@ func (h *Handler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= h.level
 }
 
-// WithGroup is a no-op, as we do not support groups yet.
+// WithGroup returns a new Handler that nests subsequent attributes under the
+// given group name. Nested groups produce nested OTLP KvlistValue attributes.
+// Empty groups (no attributes) are omitted from the output.
 func (h *Handler) WithGroup(name string) slog.Handler {
 	h2 := *h
 
@@ -387,8 +389,9 @@ func (h *Handler) convertRecord(r slog.Record) *logspb.LogRecord {
 				record.Attributes = append(record.Attributes, g.KeyValue())
 			}
 		}
-	} else if n > 0 {
-		buf := newKVBuffer(n)
+	} else {
+		buf := newKVBuffer(len(h.attrs) + n)
+		buf.AddAttrs(h.attrs)
 		r.Attrs(buf.AddAttr)
 		record.Attributes = append(record.Attributes, buf.data...)
 	}
@@ -653,7 +656,7 @@ func (g *group) KeyValue(kvs ...*commonpb.KeyValue) *commonpb.KeyValue {
 		Value: &commonpb.AnyValue{
 			Value: &commonpb.AnyValue_KvlistValue{
 				KvlistValue: &commonpb.KeyValueList{
-					Values: g.attrs.data,
+					Values: g.attrs.KeyValues(kvs...),
 				},
 			},
 		},
@@ -661,20 +664,19 @@ func (g *group) KeyValue(kvs ...*commonpb.KeyValue) *commonpb.KeyValue {
 
 	g = g.next
 	for g != nil {
-		// A Handler should not output groups if there are no attributes.
+		values := []*commonpb.KeyValue{out}
 		if g.attrs.Len() > 0 {
-			out = &commonpb.KeyValue{
-				Key: g.name,
-				Value: &commonpb.AnyValue{
-					Value: &commonpb.AnyValue_KvlistValue{
-						KvlistValue: &commonpb.KeyValueList{
-							Values: []*commonpb.KeyValue{
-								out,
-							},
-						},
+			values = append(g.attrs.data, out)
+		}
+		out = &commonpb.KeyValue{
+			Key: g.name,
+			Value: &commonpb.AnyValue{
+				Value: &commonpb.AnyValue_KvlistValue{
+					KvlistValue: &commonpb.KeyValueList{
+						Values: values,
 					},
 				},
-			}
+			},
 		}
 		g = g.next
 	}
