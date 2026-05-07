@@ -168,7 +168,7 @@ func TestInsecureEnv(t *testing.T) {
 			handler, err := slogotlp.NewHandler(
 				t.Context(),
 				slogotlp.WithEndpoint("//"+listener.Addr().String()),
-					)
+			)
 			is.NoErr(err)
 			t.Cleanup(func() { _ = handler.Shutdown(context.Background()) })
 
