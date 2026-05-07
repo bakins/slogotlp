@@ -43,7 +43,7 @@ func TestHandler(t *testing.T) {
 	})
 
 	handler, err := slogotlp.NewHandler(
-		context.Background(),
+		t.Context(),
 		slogotlp.WithEndpoint("http://"+listener.Addr().String()),
 		slogotlp.WithDialOptions(grpc.WithBlock()),
 	)
@@ -55,7 +55,7 @@ func TestHandler(t *testing.T) {
 	})
 
 	logger := slog.New(handler)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		logger.Info("test", "index", i)
 	}
 
@@ -108,7 +108,7 @@ func newTestHandler(t *testing.T) (*slogotlp.Handler, *testCollector) {
 	})
 
 	handler, err := slogotlp.NewHandler(
-		context.Background(),
+		t.Context(),
 		slogotlp.WithEndpoint("http://"+listener.Addr().String()),
 		slogotlp.WithDialOptions(grpc.WithBlock()),
 	)
@@ -168,7 +168,7 @@ func TestInsecureEnv(t *testing.T) {
 			// Endpoint without "http" scheme so the insecure decision must come
 			// from the env var path, not the scheme shortcut.
 			handler, err := slogotlp.NewHandler(
-				context.Background(),
+				t.Context(),
 				slogotlp.WithEndpoint("//"+listener.Addr().String()),
 				slogotlp.WithDialOptions(grpc.WithBlock()),
 			)
@@ -418,7 +418,7 @@ func TestTypes(t *testing.T) {
 				g.Stop()
 			})
 
-			handler, err := slogotlp.NewHandler(context.Background(), slogotlp.WithEndpoint("http://"+listener.Addr().String()))
+			handler, err := slogotlp.NewHandler(t.Context(), slogotlp.WithEndpoint("http://"+listener.Addr().String()))
 			is.NoErr(err)
 
 			t.Cleanup(func() {

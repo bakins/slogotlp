@@ -1,6 +1,6 @@
 module github.com/bakins/slogotlp
 
-go 1.21
+go 1.24
 
 require (
 	github.com/matryer/is v1.4.1
