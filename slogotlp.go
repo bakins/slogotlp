@@ -128,7 +128,7 @@ type grpcExporter struct {
 	conn   *grpc.ClientConn
 }
 
-func newGrpcExporter(ctx context.Context, opts handlerOptions) (*grpcExporter, error) {
+func newGrpcExporter(_ context.Context, opts handlerOptions) (*grpcExporter, error) {
 	if opts.endpoint == "" {
 		exporterTarget := os.Getenv(otlpLogsEndpointEnv)
 		if exporterTarget == "" {
@@ -143,7 +143,7 @@ func newGrpcExporter(ctx context.Context, opts handlerOptions) (*grpcExporter, e
 
 	u, err := url.Parse(opts.endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("unabel to parse endpoint %v", err)
+		return nil, fmt.Errorf("unable to parse endpoint %w", err)
 	}
 
 	if opts.insecure == nil {
@@ -291,7 +291,7 @@ type Handler struct {
 var _ slog.Handler = &Handler{}
 
 // Shutdown shutsdown the handler. This should be called before the process exits
-// to flush buffers and close conenctions.
+// to flush buffers and close connections.
 func (h *Handler) Shutdown(ctx context.Context) error {
 	return h.exporter.Shutdown(ctx)
 }
@@ -666,7 +666,7 @@ func (g *group) KeyValue(kvs ...*commonpb.KeyValue) *commonpb.KeyValue {
 	for g != nil {
 		values := []*commonpb.KeyValue{out}
 		if g.attrs.Len() > 0 {
-			values = append(g.attrs.data, out)
+			values = append(slices.Clone(g.attrs.data), out)
 		}
 		out = &commonpb.KeyValue{
 			Key: g.name,
@@ -683,9 +683,16 @@ func (g *group) KeyValue(kvs ...*commonpb.KeyValue) *commonpb.KeyValue {
 	return out
 }
 
+// KeyValues returns a fresh slice combining b.data and kvs. It always
+// allocates a new backing array so callers can store the result without risk
+// of later appends into b.data overwriting earlier results (which would
+// corrupt buffered log records before export).
 func (b *kvBuffer) KeyValues(kvs ...*commonpb.KeyValue) []*commonpb.KeyValue {
 	if b == nil {
-		return kvs
+		return slices.Clone(kvs)
 	}
-	return append(b.data, kvs...)
+	out := make([]*commonpb.KeyValue, 0, len(b.data)+len(kvs))
+	out = append(out, b.data...)
+	out = append(out, kvs...)
+	return out
 }
